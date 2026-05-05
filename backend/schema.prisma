@@ -1,0 +1,160 @@
+// Prisma schema para la Plataforma de Autoservicio de Despliegues
+// Compatible con PostgreSQL + Supabase
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider                    = "prisma-client-py"
+  interface                   = "asyncio"
+  recursive_type_depth        = 5
+  enable_experimental_decimal = true
+}
+
+// ============================================================
+// ENUMs — deben coincidir exactamente con los del schema SQL
+// ============================================================
+enum DeploymentEnvironment {
+  staging
+  production
+
+  @@map("deployment_environment")
+}
+
+enum DeploymentPolicy {
+  replace
+  canary
+
+  @@map("deployment_policy")
+}
+
+enum DeploymentStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  SUCCESS
+  FAILED
+  ROLLED_BACK
+  CANCELLED
+
+  @@map("deployment_status")
+}
+
+enum DeploymentEventType {
+  REQUEST_CREATED
+  ENQUEUED
+  STARTED
+  HEALTHCHECK_OK
+  HEALTHCHECK_FAIL
+  ROLLBACK_STARTED
+  ROLLBACK_OK
+  ROLLBACK_FAIL
+  FINISHED
+  ERROR
+
+  @@map("deployment_event_type")
+}
+
+enum UserRole {
+  developer
+  operator
+  admin
+
+  @@map("user_role")
+}
+
+// ============================================================
+// Tabla: user_profiles
+// Nota: id referencia auth.users de Supabase (manejado externamente)
+// ============================================================
+model UserProfile {
+  id        String   @id @db.Uuid
+  email     String?  @unique
+  full_name String?  @db.VarChar(150)
+  role      UserRole @default(developer)
+  team      String?  @db.VarChar(120)
+  is_active Boolean  @default(true)
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("user_profiles")
+}
+
+// ============================================================
+// Tabla principal: deployments
+// ============================================================
+model Deployment {
+  id                   String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  service_name         String                @db.VarChar(120)
+  image                String                @db.VarChar(255)
+  environment          DeploymentEnvironment
+  policy               DeploymentPolicy      @default(replace)
+  status               DeploymentStatus      @default(PENDING)
+
+  requested_by_user_id String?               @db.Uuid
+  requested_by_name    String?               @db.VarChar(120)
+  requested_at         DateTime              @default(now()) @db.Timestamptz(6)
+  queued_at            DateTime?             @db.Timestamptz(6)
+  started_at           DateTime?             @db.Timestamptz(6)
+  finished_at          DateTime?             @db.Timestamptz(6)
+
+  queue_name           String?               @db.VarChar(80)
+  message_id           String?               @db.Uuid
+  worker_id            String?               @db.VarChar(120)
+  retry_count          Int                   @default(0)
+
+  k8s_namespace        String?               @db.VarChar(120)
+  k8s_resource_name    String?               @db.VarChar(120)
+  rollout_revision     Int?
+
+  rollback_required    Boolean               @default(false)
+  rollback_performed   Boolean               @default(false)
+  success              Boolean?
+  error_message        String?
+  notes                String?
+
+  created_at           DateTime              @default(now()) @db.Timestamptz(6)
+  updated_at           DateTime              @default(now()) @db.Timestamptz(6)
+
+  events               DeploymentEvent[]
+  metrics              DeploymentMetric[]
+
+  @@map("deployments")
+}
+
+// ============================================================
+// Tabla: deployment_events
+// ============================================================
+model DeploymentEvent {
+  id            BigInt              @id @default(autoincrement())
+  deployment_id String              @db.Uuid
+  event_type    DeploymentEventType
+  event_status  DeploymentStatus?
+  source        String              @db.VarChar(50)
+  message       String
+  details       Json?
+  created_at    DateTime            @default(now()) @db.Timestamptz(6)
+  actor_user_id String?             @db.Uuid
+
+  deployment    Deployment          @relation(fields: [deployment_id], references: [id], onDelete: Cascade)
+
+  @@map("deployment_events")
+}
+
+// ============================================================
+// Tabla: deployment_metrics
+// ============================================================
+model DeploymentMetric {
+  id            BigInt   @id @default(autoincrement())
+  deployment_id String   @db.Uuid
+  metric_name   String   @db.VarChar(80)
+  metric_value  Float
+  unit          String?  @db.VarChar(30)
+  recorded_at   DateTime @default(now()) @db.Timestamptz(6)
+
+  deployment    Deployment @relation(fields: [deployment_id], references: [id], onDelete: Cascade)
+
+  @@map("deployment_metrics")
+}
