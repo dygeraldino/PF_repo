@@ -1,32 +1,44 @@
 version: '3.8'
 
 services:
-  db:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: paas_db
+
+  # ── RabbitMQ ────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
     ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI → http://localhost:15672 (guest/guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
       timeout: 5s
       retries: 5
 
+  # ── API ─────────────────────────────────────────────────────────────────
   api:
     build: .
     ports:
       - "8000:8000"
+    env_file: .env
     depends_on:
-      db:
+      rabbitmq:
         condition: service_healthy
     volumes:
-      - .:/app # Montar para hot-reload en desarrollo local
+      - .:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-volumes:
-  postgres_data:
+  # ── Worker ──────────────────────────────────────────────────────────────
+  # Misma imagen que la API, diferente CMD — cero overhead extra de build
+  worker:
+    build: .
+    env_file: .env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: python -m app.workers.deployment_worker
+    restart: on-failure  # Si RabbitMQ no está listo, reintenta

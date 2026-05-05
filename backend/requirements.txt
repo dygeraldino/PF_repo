@@ -4,3 +4,4 @@ prisma==0.15.0
 pydantic==2.7.4
 pydantic-settings==2.3.4
 python-dotenv==1.0.1
+aio-pika==9.4.3

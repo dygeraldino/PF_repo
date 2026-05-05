@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from prisma import Prisma
+from pydantic import BaseModel
 from typing import List, Optional
 
 from app.core.database import get_prisma
@@ -11,8 +12,12 @@ from app.api.dependencies import get_current_user_id
 
 router = APIRouter(prefix="/deployments", tags=["deployments"])
 
+
+# ---------------------------------------------------------------------------
+# Serialization helpers
+# ---------------------------------------------------------------------------
+
 def _to_deployment_response(d) -> dict:
-    """Convierte el objeto Prisma a un dict serializable para Pydantic."""
     return {
         "id": str(d.id),
         "service_name": d.service_name,
@@ -42,6 +47,7 @@ def _to_deployment_response(d) -> dict:
         "updated_at": d.updated_at,
     }
 
+
 def _to_event_response(e) -> dict:
     return {
         "id": e.id,
@@ -55,78 +61,134 @@ def _to_event_response(e) -> dict:
         "actor_user_id": str(e.actor_user_id) if e.actor_user_id else None,
     }
 
+
+# ---------------------------------------------------------------------------
+# Endpoints — deployments CRUD
+# ---------------------------------------------------------------------------
+
 @router.post("", response_model=DeploymentResponse, status_code=201)
 async def create_deployment(
     deployment_in: DeploymentCreate,
     prisma: Prisma = Depends(get_prisma),
-    user_id: Optional[str] = Depends(get_current_user_id)
+    user_id: Optional[str] = Depends(get_current_user_id),
 ):
-    """Crea una solicitud de despliegue."""
+    """Crea una solicitud de despliegue y la encola en RabbitMQ."""
     result = await deployment_service.create_deployment(prisma, deployment_in, user_id)
     return DeploymentResponse(**_to_deployment_response(result))
+
 
 @router.get("", response_model=List[DeploymentResponse])
 async def list_deployments(
     status: Optional[DeploymentStatus] = Query(None),
     environment: Optional[str] = Query(None),
+    service_name: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None),
-    prisma: Prisma = Depends(get_prisma)
+    limit: int = Query(50, ge=1, le=200),
+    prisma: Prisma = Depends(get_prisma),
 ):
-    """Lista solicitudes con filtros opcionales por estado, entorno y usuario."""
+    """Lista deployments con filtros opcionales."""
     results = await deployment_service.list_deployments(
         prisma,
         status=status.value if status else None,
         environment=environment,
-        user_id=user_id
+        service_name=service_name,
+        user_id=user_id,
+        limit=limit,
     )
     return [DeploymentResponse(**_to_deployment_response(d)) for d in results]
 
+
 @router.get("/{id}", response_model=DeploymentResponse)
-async def get_deployment(
-    id: str,
-    prisma: Prisma = Depends(get_prisma)
-):
-    """Devuelve detalle de una solicitud."""
-    deployment = await deployment_service.get_deployment(prisma, id)
-    if not deployment:
+async def get_deployment(id: str, prisma: Prisma = Depends(get_prisma)):
+    """Detalle de un deployment."""
+    dep = await deployment_service.get_deployment(prisma, id)
+    if not dep:
         raise HTTPException(status_code=404, detail="Deployment no encontrado")
-    return DeploymentResponse(**_to_deployment_response(deployment))
+    return DeploymentResponse(**_to_deployment_response(dep))
+
 
 @router.patch("/{id}/status", response_model=DeploymentResponse)
 async def update_deployment_status(
     id: str,
     status_update: DeploymentStatusUpdate,
     prisma: Prisma = Depends(get_prisma),
-    user_id: Optional[str] = Depends(get_current_user_id)
+    user_id: Optional[str] = Depends(get_current_user_id),
 ):
-    """Actualiza el estado del despliegue."""
-    deployment = await deployment_service.update_deployment_status(prisma, id, status_update, user_id)
-    if not deployment:
+    """Actualiza el estado de un deployment manualmente."""
+    dep = await deployment_service.update_deployment_status(prisma, id, status_update, user_id)
+    if not dep:
         raise HTTPException(status_code=404, detail="Deployment no encontrado")
-    return DeploymentResponse(**_to_deployment_response(deployment))
+    return DeploymentResponse(**_to_deployment_response(dep))
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — events
+# ---------------------------------------------------------------------------
 
 @router.post("/{id}/events", response_model=DeploymentEventResponse, status_code=201)
 async def create_deployment_event(
     id: str,
     event_in: DeploymentEventCreate,
     prisma: Prisma = Depends(get_prisma),
-    user_id: Optional[str] = Depends(get_current_user_id)
+    user_id: Optional[str] = Depends(get_current_user_id),
 ):
-    """Registra un evento de trazabilidad."""
-    deployment = await deployment_service.get_deployment(prisma, id)
-    if not deployment:
+    """Registra un evento de trazabilidad manual."""
+    dep = await deployment_service.get_deployment(prisma, id)
+    if not dep:
         raise HTTPException(status_code=404, detail="Deployment no encontrado")
     event = await deployment_service.log_event(prisma, id, event_in, user_id)
     return DeploymentEventResponse(**_to_event_response(event))
 
+
 @router.get("/{id}/events", response_model=List[DeploymentEventResponse])
-async def get_deployment_events(
-    id: str,
-    prisma: Prisma = Depends(get_prisma)
-):
-    """Consulta el historial de eventos."""
-    deployment = await deployment_service.get_deployment(prisma, id)
-    if not deployment:
+async def get_deployment_events(id: str, prisma: Prisma = Depends(get_prisma)):
+    """Historial de eventos de un deployment (ordenado cronológicamente)."""
+    dep = await deployment_service.get_deployment(prisma, id)
+    if not dep:
         raise HTTPException(status_code=404, detail="Deployment no encontrado")
     events = await deployment_service.get_deployment_events(prisma, id)
     return [DeploymentEventResponse(**_to_event_response(e)) for e in events]
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — acciones operativas
+# ---------------------------------------------------------------------------
+
+class RollbackRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.post("/{id}/promote", response_model=DeploymentResponse, status_code=201)
+async def promote_to_production(
+    id: str,
+    prisma: Prisma = Depends(get_prisma),
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """
+    Promueve un deployment exitoso de staging a producción.
+    Crea un nuevo deployment con el mismo service/image pero en environment=production.
+    Solo funciona si el deployment origen está en SUCCESS y es de staging.
+    """
+    new_dep, error = await deployment_service.promote_to_production(prisma, id, user_id)
+    if error:
+        raise HTTPException(status_code=422, detail=error)
+    return DeploymentResponse(**_to_deployment_response(new_dep))
+
+
+@router.post("/{id}/rollback", response_model=DeploymentResponse)
+async def rollback_deployment(
+    id: str,
+    body: RollbackRequest = RollbackRequest(),
+    prisma: Prisma = Depends(get_prisma),
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """
+    Inicia un rollback manual del deployment.
+    Publica un mensaje de rollback en RabbitMQ para que el worker lo procese.
+    """
+    dep, error = await deployment_service.trigger_rollback(
+        prisma, id, reason=body.reason, user_id=user_id
+    )
+    if error:
+        raise HTTPException(status_code=422, detail=error)
+    return DeploymentResponse(**_to_deployment_response(dep))

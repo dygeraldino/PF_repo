@@ -1,27 +1,45 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import logging
 
 from app.core.config import settings
 from app.core.database import prisma_client
+from app.integrations.rabbitmq import rabbitmq_client
 from app.api.routers import deployments, health
+
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Conectar el cliente Prisma al iniciar
+    # ── Startup ──────────────────────────────────────────────────────────────
     await prisma_client.connect()
+    logger.info("Prisma conectado a la base de datos")
+
+    try:
+        await rabbitmq_client.connect()
+        logger.info("RabbitMQ conectado")
+    except Exception as e:
+        # La API arranca aunque RabbitMQ no esté disponible.
+        # Los deployments quedarán en PENDING y se registrará el error en eventos.
+        logger.warning(f"RabbitMQ no disponible al iniciar: {e}. La API continúa sin cola.")
+
     yield
-    # Desconectar al cerrar
+
+    # ── Shutdown ─────────────────────────────────────────────────────────────
+    await rabbitmq_client.disconnect()
     await prisma_client.disconnect()
+    logger.info("Servicios desconectados")
+
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="API para la Plataforma de Autoservicio para Despliegues Controlados",
-    version="0.1.0",
-    lifespan=lifespan
+    description="API para la Plataforma de Autoservicio de Despliegues sobre Kubernetes",
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
-# Configurar CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,10 +48,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Incluir routers
 app.include_router(health.router)
 app.include_router(deployments.router)
 
-@app.get("/")
+
+@app.get("/", tags=["root"])
 async def root():
-    return {"message": "Bienvenido a la API de Despliegues. Visita /docs para la documentación."}
+    return {
+        "message": "PaaS Deployments API",
+        "docs": "/docs",
+        "health": "/health",
+    }
