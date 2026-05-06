@@ -1,6 +1,0 @@
-{
-  "service_name": "test-service",
-  "image": "nginx:latest",
-  "environment": "staging",
-  "policy": "replace"
-}

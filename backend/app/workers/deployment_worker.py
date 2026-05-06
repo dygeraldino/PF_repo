@@ -68,7 +68,10 @@ async def _log_event(
 
 
 async def _set_status(prisma: Prisma, deployment_id: str, update_data: dict):
-    """Actualiza el deployment en la base de datos."""
+    """Actualiza el deployment en la base de datos asegurando tipos correctos."""
+    if "status" in update_data and isinstance(update_data["status"], str):
+        update_data["status"] = DeploymentStatus(update_data["status"])
+    
     await prisma.deployment.update(where={"id": deployment_id}, data=update_data)
 
 
@@ -104,7 +107,7 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
         )
 
         # 2. Aplicar en Kubernetes
-        apply_result = await k8s.apply_deployment(namespace, resource_name, image, policy)
+        apply_result = await k8s.apply_deployment(namespace, resource_name, image, policy, service_name)
 
         if not apply_result["success"]:
             raise RuntimeError(f"kubectl apply falló: {apply_result['message']}")

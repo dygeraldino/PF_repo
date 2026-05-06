@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ resource_name }}
+  namespace: {{ namespace }}
+  labels:
+    app: {{ service_name }}
+    paas-managed: "true"
+spec:
+  replicas: {{ replicas | default(1) }}
+  selector:
+    matchLabels:
+      app: {{ service_name }}
+  template:
+    metadata:
+      labels:
+        app: {{ service_name }}
+    spec:
+      containers:
+      - name: app
+        image: {{ image }}
+        imagePullPolicy: IfNotPresent # Ideal para Kind (usando kind load)
+        ports:
+        - containerPort: {{ port | default(8000) }}
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+        livenessProbe:
+          httpGet:
+            path: {{ health_path | default('/health') }}
+            port: {{ port | default(8000) }}
+          initialDelaySeconds: 15
+          periodSeconds: 20

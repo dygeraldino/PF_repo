@@ -28,6 +28,7 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
+      - ${HOME:-~}/.kube/config:/root/.kube/config:ro
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   # ── Worker ──────────────────────────────────────────────────────────────
@@ -40,5 +41,6 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
+      - ${HOME:-~}/.kube/config:/root/.kube/config:ro
     command: python -m app.workers.deployment_worker
     restart: on-failure  # Si RabbitMQ no está listo, reintenta
