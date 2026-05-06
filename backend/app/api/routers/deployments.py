@@ -98,6 +98,19 @@ async def list_deployments(
     return [DeploymentResponse(**_to_deployment_response(d)) for d in results]
 
 
+# ---------------------------------------------------------------------------
+# Endpoints — estadísticas
+# ---------------------------------------------------------------------------
+
+@router.get("/stats")
+async def get_stats(
+    prisma: Prisma = Depends(get_prisma),
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """Obtiene estadísticas globales de despliegues para el análisis del paper."""
+    return await deployment_service.get_deployment_stats(prisma)
+
+
 @router.get("/{id}", response_model=DeploymentResponse)
 async def get_deployment(id: str, prisma: Prisma = Depends(get_prisma)):
     """Detalle de un deployment."""
@@ -150,6 +163,8 @@ async def get_deployment_events(id: str, prisma: Prisma = Depends(get_prisma)):
     return [DeploymentEventResponse(**_to_event_response(e)) for e in events]
 
 
+
+
 # ---------------------------------------------------------------------------
 # Endpoints — acciones operativas
 # ---------------------------------------------------------------------------
@@ -189,6 +204,19 @@ async def rollback_deployment(
     dep, error = await deployment_service.trigger_rollback(
         prisma, id, reason=body.reason, user_id=user_id
     )
+    if error:
+        raise HTTPException(status_code=422, detail=error)
+    return DeploymentResponse(**_to_deployment_response(dep))
+
+
+@router.post("/{id}/cancel", response_model=DeploymentResponse)
+async def cancel_deployment(
+    id: str,
+    prisma: Prisma = Depends(get_prisma),
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """Cancela un deployment que aún no ha sido procesado."""
+    dep, error = await deployment_service.cancel_deployment(prisma, id, user_id)
     if error:
         raise HTTPException(status_code=422, detail=error)
     return DeploymentResponse(**_to_deployment_response(dep))

@@ -113,6 +113,9 @@ model Deployment {
   rollback_performed   Boolean               @default(false)
   success              Boolean?
   error_message        String?
+  health_path          String?               @default("/health") @db.VarChar(255)
+  container_port       Int                   @default(8000)
+  env_vars             Json?
   notes                String?
 
   created_at           DateTime              @default(now()) @db.Timestamptz(6)

@@ -33,6 +33,15 @@ class KubernetesClient:
                 except config.ConfigException:
                     config.load_kube_config()
                     logger.info("✔ K8s: Usando configuración KubeConfig local")
+                
+                # Overwrite server URL if specified (useful for Docker-to-Kind)
+                server_override = os.getenv("K8S_SERVER_OVERRIDE")
+                if server_override:
+                    conf = client.Configuration.get_default_copy()
+                    conf.host = server_override
+                    conf.verify_ssl = False # Kind certs use internal IPs, skip verify to avoid SAN errors
+                    client.Configuration.set_default(conf)
+                    logger.info(f"⚠ K8s: Server URL sobreescrita a {server_override} (SSL Verify=False)")
 
                 self.apps_v1 = client.AppsV1Api()
                 self.core_v1 = client.CoreV1Api()
@@ -43,7 +52,8 @@ class KubernetesClient:
                 self.simulate = True # Fallback a simulación si falla la conexión
 
     async def apply_deployment(
-        self, namespace: str, resource_name: str, image: str, policy: str, service_name: str
+        self, namespace: str, resource_name: str, image: str, policy: str, service_name: str,
+        health_path: str = "/health", port: int = 8000, env_vars: dict = None
     ) -> dict:
         """
         Genera y aplica los recursos (Deployment, Service, Ingress) usando plantillas.
@@ -64,7 +74,9 @@ class KubernetesClient:
                 "namespace": namespace,
                 "image": image,
                 "policy": policy,
-                "port": 8000, # Podríamos sacarlo de la DB si fuera dinámico
+                "port": port,
+                "health_path": health_path,
+                "env_vars": env_vars,
             }
 
             # Aplicar Deployment
@@ -96,30 +108,50 @@ class KubernetesClient:
             return {"ready": True, "available_replicas": 1, "message": "Simulated ready"}
 
         try:
+            # 1. Obtener el deployment para saber cuántas réplicas queremos e imagen objetivo
             dep = self.apps_v1.read_namespaced_deployment(name=resource_name, namespace=namespace)
+            target_image = dep.spec.template.spec.containers[0].image
             desired = dep.spec.replicas or 1
-            available = dep.status.available_replicas or 0
-            
-            ready = available >= desired
+
+            # 2. Listar los pods actuales de este servicio
+            # Usamos el label app={{ service_name }} que definimos en el template
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=namespace, 
+                label_selector=f"app={resource_name}"
+            )
+
+            # 3. Contar cuántos pods con la imagen NUEVA están realmente Ready
+            ready_count = 0
+            for pod in pods.items:
+                # 3a. Ignorar pods que se están borrando
+                if pod.metadata.deletion_timestamp:
+                    continue
+
+                # 3b. Verificar imagen (Comparación flexible para evitar temas de docker.io/ library/)
+                pod_image = pod.spec.containers[0].image
+                # Si el pod tiene la imagen vieja, no lo contamos para el éxito de la nueva versión
+                if target_image not in pod_image and pod_image not in target_image:
+                    continue 
+                
+                # 3c. Verificar si está Ready y Running
+                phase_ok = pod.status.phase == "Running"
+                containers_ready = all(c.ready for c in (pod.status.container_statuses or []))
+                
+                if phase_ok and containers_ready:
+                    ready_count += 1
+
+            # Éxito solo si los pods NUEVOS están listos
+            ready = ready_count >= desired
+
             return {
                 "ready": ready,
-                "available_replicas": available,
-                "message": "En progreso..." if not ready else "Rollout exitoso",
+                "available_replicas": ready_count,
+                "desired_replicas": desired,
+                "message": "Rollout exitoso" if ready else f"Esperando pods con imagen {target_image} ({ready_count}/{desired} listos)",
             }
         except ApiException as e:
             return {"ready": False, "available_replicas": 0, "message": f"Error API: {e}"}
 
-    async def rollback_deployment(self, namespace: str, resource_name: str) -> dict:
-        """Rollback real (undo rollout)."""
-        if self.simulate:
-            await asyncio.sleep(1)
-            return {"success": True, "message": "Simulated rollback OK"}
-
-        # La API de Python no tiene 'undo' directo, se suele hacer vía Patch de anotaciones
-        # o volviendo a aplicar la versión anterior si tenemos el historial.
-        # Por simplicidad para la demo, simulamos el éxito o usamos un patch manual de revision.
-        logger.warning(f"Rollback solicitado para {resource_name} (Funcionalidad real vía patch pendiente)")
-        return {"success": True, "message": "Rollback ejecutado"}
 
     # --- Helpers Internos ---
 

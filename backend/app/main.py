@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
+from prometheus_client import make_asgi_app
 
 from app.core.config import settings
 from app.core.database import prisma_client
@@ -50,6 +51,10 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(deployments.router)
+
+# Expose metrics for Prometheus
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
 
 @app.get("/", tags=["root"])

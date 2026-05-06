@@ -1,17 +1,11 @@
 """
 Worker de despliegues — proceso independiente que consume de RabbitMQ.
-
-Flujo por mensaje:
-  QUEUED → RUNNING → (K8s apply + health checks) → SUCCESS | ROLLED_BACK | FAILED
-
-Ejecutar con:
-  python -m app.workers.deployment_worker
-  o via docker-compose (servicio 'worker')
 """
 
 import asyncio
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 
 import aio_pika
@@ -23,8 +17,34 @@ from prisma.enums import (
     DeploymentPolicy,
 )
 
+from prometheus_client import Counter, Histogram, start_http_server
+
 from app.core.config import settings
 from app.integrations.kubernetes_client import KubernetesClient
+
+# ---------------------------------------------------------------------------
+# Prometheus Metrics
+# ---------------------------------------------------------------------------
+deploy_duration = Histogram(
+    'paas_deploy_duration_seconds', 
+    'Duración del despliegue en segundos', 
+    ['environment', 'policy']
+)
+deploy_success = Counter(
+    'paas_deploy_success_total', 
+    'Total de despliegues exitosos', 
+    ['environment']
+)
+deploy_failed = Counter(
+    'paas_deploy_failed_total', 
+    'Total de despliegues fallidos', 
+    ['environment']
+)
+rollback_events = Counter(
+    'paas_rollback_total', 
+    'Total de rollbacks ejecutados', 
+    ['environment', 'type']
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +56,8 @@ QUEUE_STAGING = "deployments.staging"
 QUEUE_PRODUCTION = "deployments.production"
 QUEUE_DLQ = "deployments.dlq"
 
-MAX_HEALTH_CHECKS = 3
+WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
+MAX_HEALTH_CHECKS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +73,6 @@ async def _log_event(
     details: dict = None,
 ):
     """Registra un evento de trazabilidad en deployment_events."""
-    # Asegurar que usamos el miembro del Enum de Prisma invocando el constructor
     data = {
         "deployment": {"connect": {"id": deployment_id}},
         "event_type": DeploymentEventType(event_type),
@@ -75,6 +95,19 @@ async def _set_status(prisma: Prisma, deployment_id: str, update_data: dict):
     await prisma.deployment.update(where={"id": deployment_id}, data=update_data)
 
 
+async def _record_metric(prisma: Prisma, deployment_id: str, name: str, value: float, unit: str = "seconds"):
+    """Registra una métrica en la tabla deployment_metrics para el análisis estadístico."""
+    try:
+        await prisma.deploymentmetric.create(data={
+            "deployment_id": deployment_id,
+            "metric_name": name,
+            "metric_value": value,
+            "unit": unit
+        })
+    except Exception as e:
+        logger.error(f"Error al registrar métrica {name}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Core processing logic
 # ---------------------------------------------------------------------------
@@ -91,15 +124,41 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
     policy = payload.get("policy", "replace")
     namespace = payload.get("k8s_namespace") or f"{environment}-ns"
     resource_name = payload.get("k8s_resource_name") or service_name
+    health_path = payload.get("health_path", "/health")
+    container_port = payload.get("container_port", 8000)
+    env_vars = payload.get("env_vars")
 
-    logger.info(f"▶ Procesando deployment {deployment_id} ({service_name} → {environment})")
+    is_rollback = payload.get("is_rollback", False)
+
+    logger.info(f"▶ Procesando deployment {deployment_id} ({service_name} → {environment}){' [ROLLBACK]' if is_rollback else ''}")
 
     try:
+        # Si es un rollback solicitado manualmente, primero debemos encontrar la imagen a la cual volver
+        if is_rollback:
+            logger.info(f"🔍 Buscando versión anterior para rollback manual de {service_name}")
+            last_success = await prisma.deployment.find_first(
+                where={
+                    "service_name": service_name,
+                    "environment": DeploymentEnvironment(environment),
+                    "status": DeploymentStatus.SUCCESS,
+                    "id": {"not": deployment_id}
+                },
+                order={"created_at": "desc"}
+            )
+            
+            if last_success:
+                image = last_success.image
+                env_vars = last_success.env_vars
+                logger.info(f"↩ Imagen recuperada para rollback manual: {image}")
+            else:
+                raise RuntimeError("No se encontró una versión anterior exitosa para realizar el rollback manual")
+
         # 1. Marcar como RUNNING
         now = datetime.now(timezone.utc)
         await _set_status(prisma, deployment_id, {
             "status": DeploymentStatus.RUNNING,
             "started_at": now,
+            "worker_id": WORKER_ID,
         })
         await _log_event(
             prisma, deployment_id, "STARTED", "RUNNING",
@@ -107,7 +166,11 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
         )
 
         # 2. Aplicar en Kubernetes
-        apply_result = await k8s.apply_deployment(namespace, resource_name, image, policy, service_name)
+        apply_result = await k8s.apply_deployment(
+            namespace, resource_name, image, policy, service_name,
+            health_path=health_path, port=container_port,
+            env_vars=env_vars
+        )
 
         if not apply_result["success"]:
             raise RuntimeError(f"kubectl apply falló: {apply_result['message']}")
@@ -120,12 +183,9 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
 
         # 3. Health checks con reintentos
         rollout_ok = False
-        last_status_result = {}
-
         for attempt in range(1, MAX_HEALTH_CHECKS + 1):
             logger.info(f"Health check {attempt}/{MAX_HEALTH_CHECKS} para {deployment_id}")
             status_result = await k8s.check_rollout_status(namespace, resource_name)
-            last_status_result = status_result
 
             if status_result["ready"]:
                 rollout_ok = True
@@ -160,48 +220,99 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
                 f"✅ Despliegue de {service_name} completado exitosamente en {environment}",
             )
             logger.info(f"✅ Deployment {deployment_id} → SUCCESS")
+            
+            # Registrar Métricas de Éxito
+            duration = (finished - now).total_seconds()
+            deploy_duration.labels(environment=environment, policy=policy).observe(duration)
+            deploy_success.labels(environment=environment).inc()
+            
+            await _record_metric(prisma, deployment_id, "deploy_duration", duration)
+            await _record_metric(prisma, deployment_id, "success_rate", 1.0, unit="ratio")
+            if is_rollback:
+                rollback_events.labels(environment=environment, type="manual").inc()
+                await _record_metric(prisma, deployment_id, "is_rollback", 1.0, unit="boolean")
 
         else:
-            # Health checks fallaron → intentar rollback
-            logger.warning(f"⚠ Deployment {deployment_id} falló — iniciando rollback")
-            await _log_event(
-                prisma, deployment_id, "ROLLBACK_STARTED", "RUNNING",
-                f"Health checks fallaron después de {MAX_HEALTH_CHECKS} intentos. Iniciando rollback...",
+            # Health checks fallaron → intentar rollback buscando la imagen anterior en la DB
+            logger.warning(f"⚠ Deployment {deployment_id} falló — buscando versión anterior para rollback")
+            
+            last_success = await prisma.deployment.find_first(
+                where={
+                    "service_name": service_name,
+                    "environment": DeploymentEnvironment(environment),
+                    "status": DeploymentStatus.SUCCESS,
+                    "id": {"not": deployment_id}
+                },
+                order={"created_at": "desc"}
             )
 
-            rollback_result = await k8s.rollback_deployment(namespace, resource_name)
-            finished = datetime.now(timezone.utc)
-
-            if rollback_result["success"]:
-                await _set_status(prisma, deployment_id, {
-                    "status": DeploymentStatus.ROLLED_BACK,
-                    "success": False,
-                    "rollback_required": True,
-                    "rollback_performed": True,
-                    "finished_at": finished,
-                    "error_message": "Health checks fallaron. Rollback ejecutado automáticamente.",
-                })
+            if last_success:
+                logger.info(f"↩ Reventiendo a la imagen anterior: {last_success.image}")
                 await _log_event(
-                    prisma, deployment_id, "ROLLBACK_OK", "ROLLED_BACK",
-                    f"↩ Rollback de {service_name} completado. Versión anterior restaurada.",
-                    details=rollback_result,
+                    prisma, deployment_id, "ROLLBACK_STARTED", "RUNNING",
+                    f"Iniciando reversión automática a la versión anterior ({last_success.image})...",
                 )
-                logger.info(f"↩ Deployment {deployment_id} → ROLLED_BACK")
+                
+                rollback_result = await k8s.apply_deployment(
+                    namespace, resource_name, last_success.image, "replace", service_name,
+                    health_path=health_path, 
+                    port=container_port,
+                    env_vars=last_success.env_vars
+                )
+                
+                if rollback_result["success"]:
+                    # Esperar a que el rollback sea exitoso (Health Check)
+                    logger.info(f"Esperando salud del rollback para {service_name}...")
+                    rb_ok = False
+                    for rb_attempt in range(1, 6):
+                        rb_status = await k8s.check_rollout_status(namespace, resource_name)
+                        if rb_status["ready"]:
+                            rb_ok = True
+                            break
+                        await asyncio.sleep(3)
+
+                    finished = datetime.now(timezone.utc)
+                    await _set_status(prisma, deployment_id, {
+                        "status": DeploymentStatus.ROLLED_BACK,
+                        "success": False,
+                        "rollback_required": True,
+                        "rollback_performed": True,
+                        "finished_at": finished,
+                        "error_message": "Health checks fallaron. Rollback ejecutado automáticamente." if rb_ok else "Health checks fallaron. Rollback ejecutado pero no alcanzó estado saludable.",
+                    })
+                    
+                    status_msg = "↩ Rollback completado y verificado." if rb_ok else "⚠️ Rollback aplicado pero no se pudo verificar salud."
+                    await _log_event(
+                        prisma, deployment_id, "ROLLBACK_OK" if rb_ok else "ROLLBACK_FAIL", "ROLLED_BACK",
+                        f"{status_msg} Versión anterior ({last_success.image}) restaurada.",
+                        details=rollback_result,
+                    )
+                    
+                    # Métricas Rollback exitoso
+                    duration = (finished - now).total_seconds()
+                    deploy_duration.labels(environment=environment, policy=policy).observe(duration)
+                    rollback_events.labels(environment=environment, type="auto").inc()
+                    
+                    await _record_metric(prisma, deployment_id, "deploy_duration", duration)
+                    await _record_metric(prisma, deployment_id, "is_rollback", 1.0, unit="boolean")
+                    await _record_metric(prisma, deployment_id, "auto_recovery", 1.0, unit="boolean")
+                else:
+                    await _set_status(prisma, deployment_id, {
+                        "status": DeploymentStatus.FAILED,
+                        "success": False,
+                        "finished_at": finished,
+                        "error_message": f"Rollback falló: {rollback_result.get('message')}",
+                    })
             else:
+                logger.error("❌ No se encontró una versión anterior exitosa para hacer rollback")
                 await _set_status(prisma, deployment_id, {
                     "status": DeploymentStatus.FAILED,
                     "success": False,
-                    "rollback_required": True,
-                    "rollback_performed": False,
                     "finished_at": finished,
-                    "error_message": f"Health checks y rollback fallaron: {rollback_result['message']}",
+                    "error_message": "Health checks fallaron y no hay versión previa exitosa.",
                 })
-                await _log_event(
-                    prisma, deployment_id, "ROLLBACK_FAIL", "FAILED",
-                    f"❌ Rollback también falló. Intervención manual requerida.",
-                    details=rollback_result,
-                )
-                logger.error(f"❌ Deployment {deployment_id} → FAILED (rollback failed too)")
+                deploy_failed.labels(environment=environment).inc()
+                await _record_metric(prisma, deployment_id, "success_rate", 0.0, unit="ratio")
 
     except Exception as exc:
         logger.exception(f"Error inesperado procesando deployment {deployment_id}: {exc}")
@@ -217,72 +328,73 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
                 prisma, deployment_id, "ERROR", "FAILED",
                 f"Error inesperado en el worker: {str(exc)[:300]}",
             )
+            deploy_failed.labels(environment=environment).inc()
+            await _record_metric(prisma, deployment_id, "success_rate", 0.0, unit="ratio")
         except Exception as inner:
-            logger.exception(f"No se pudo actualizar estado del deployment tras error: {inner}")
-        raise  # Re-raise → aio-pika envía el mensaje a DLQ
+            logger.exception(f"No se pudo actualizar estado: {inner}")
+        raise
 
-
-# ---------------------------------------------------------------------------
-# Worker entrypoint
-# ---------------------------------------------------------------------------
 
 async def main():
     logger.info("🚀 Iniciando Deployment Worker...")
+    
+    # Iniciar servidor de métricas para el Worker en puerto 8001
+    try:
+        start_http_server(8001)
+        logger.info("📊 Servidor de métricas Prometheus iniciado en puerto 8001")
+    except Exception as e:
+        logger.warning(f"No se pudo iniciar servidor de métricas: {e}")
 
-    # Conectar Prisma
     prisma = Prisma()
     await prisma.connect()
-    logger.info("✔ Prisma conectado a la base de datos")
-
-    # Inicializar cliente K8s
     k8s = KubernetesClient(simulate=settings.SIMULATE_K8S)
-    logger.info(f"✔ Kubernetes client listo (simulate={settings.SIMULATE_K8S})")
-
-    # Conectar RabbitMQ
+    
     connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
-    channel = await connection.channel()
-    await channel.set_qos(prefetch_count=1)
-
-    # Declarar colas (idempotente)
-    await channel.declare_queue(QUEUE_DLQ, durable=True)
-    for qname in [QUEUE_STAGING, QUEUE_PRODUCTION]:
-        await channel.declare_queue(
-            qname,
-            durable=True,
-            arguments={
-                "x-dead-letter-exchange": "",
-                "x-dead-letter-routing-key": QUEUE_DLQ,
-            }
-        )
+    
+    # Canal para Staging (Procesamiento en paralelo)
+    channel_staging = await connection.channel()
+    await channel_staging.set_qos(prefetch_count=5)
+    
+    # Canal para Producción (Procesamiento serial estricto)
+    channel_prod = await connection.channel()
+    await channel_prod.set_qos(prefetch_count=1)
 
     async def on_message(message: aio_pika.IncomingMessage):
-        """Callback invocado por cada mensaje recibido."""
         async with message.process(requeue=False):
             try:
                 payload = json.loads(message.body.decode())
-                logger.info(f"📨 Mensaje recibido: deployment_id={payload.get('deployment_id')}")
                 await process_deployment(prisma, k8s, payload)
             except Exception:
-                logger.exception("Procesamiento del mensaje falló — enviando a DLQ")
-                # aio-pika hace nack automáticamente al salir del context manager
-                # con requeue=False, el DLQ routing-key del mensaje lo redirige a deployments.dlq
+                logger.exception("Procesamiento falló")
 
-    # Suscribirse a ambas colas
-    staging_q = await channel.get_queue(QUEUE_STAGING)
-    production_q = await channel.get_queue(QUEUE_PRODUCTION)
+    # Declarar colas en sus respectivos canales
+    await channel_staging.declare_queue(QUEUE_DLQ, durable=True)
+    
+    staging_q = await channel_staging.declare_queue(
+        QUEUE_STAGING, 
+        durable=True,
+        arguments={
+            "x-dead-letter-exchange": "",
+            "x-dead-letter-routing-key": QUEUE_DLQ,
+        }
+    )
+    production_q = await channel_prod.declare_queue(
+        QUEUE_PRODUCTION, 
+        durable=True,
+        arguments={
+            "x-dead-letter-exchange": "",
+            "x-dead-letter-routing-key": QUEUE_DLQ,
+        }
+    )
     await staging_q.consume(on_message)
     await production_q.consume(on_message)
 
-    logger.info(
-        f"⏳ Worker listo. Escuchando en: {QUEUE_STAGING}, {QUEUE_PRODUCTION}"
-    )
-
+    logger.info("⏳ Worker listo...")
     try:
-        await asyncio.Future()  # Correr indefinidamente
+        await asyncio.Future()
     finally:
         await prisma.disconnect()
         await connection.close()
-        logger.info("Worker detenido.")
 
 
 if __name__ == "__main__":

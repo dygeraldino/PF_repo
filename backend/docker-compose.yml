@@ -16,6 +16,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - kind
 
   # ── API ─────────────────────────────────────────────────────────────────
   api:
@@ -29,6 +31,8 @@ services:
     volumes:
       - .:/app
       - ${HOME:-~}/.kube/config:/root/.kube/config:ro
+    networks:
+      - kind
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   # ── Worker ──────────────────────────────────────────────────────────────
@@ -42,5 +46,33 @@ services:
     volumes:
       - .:/app
       - ${HOME:-~}/.kube/config:/root/.kube/config:ro
+    networks:
+      - kind
     command: python -m app.workers.deployment_worker
     restart: on-failure  # Si RabbitMQ no está listo, reintenta
+
+  # ── Observability ────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - kind
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    networks:
+      - kind
+
+networks:
+  kind:
+    external: true

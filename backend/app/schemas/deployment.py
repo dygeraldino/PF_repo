@@ -11,6 +11,9 @@ class DeploymentBase(BaseModel):
     policy: DeploymentPolicy = DeploymentPolicy.replace
     k8s_namespace: Optional[str] = None
     k8s_resource_name: Optional[str] = None
+    health_path: Optional[str] = Field(default='/health', description="Path for liveness probe, e.g. / or /health")
+    container_port: Optional[int] = Field(default=8000, description="Port the container listens on")
+    env_vars: Optional[dict] = None
 
 class DeploymentCreate(DeploymentBase):
     pass
