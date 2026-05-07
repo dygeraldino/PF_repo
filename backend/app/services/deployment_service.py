@@ -51,8 +51,11 @@ async def log_event(
 # CRUD
 # ---------------------------------------------------------------------------
 
-async def get_deployment(prisma: Prisma, deployment_id: str):
-    return await prisma.deployment.find_unique(where={"id": deployment_id})
+async def get_deployment(prisma: Prisma, deployment_id: str, user_id: str = None):
+    where = {"id": deployment_id}
+    if user_id:
+        where["requested_by_user_id"] = user_id
+    return await prisma.deployment.find_unique(where=where)
 
 
 async def list_deployments(
@@ -80,7 +83,12 @@ async def list_deployments(
     )
 
 
-async def get_deployment_events(prisma: Prisma, deployment_id: str):
+async def get_deployment_events(prisma: Prisma, deployment_id: str, user_id: str = None):
+    # Primero verificamos si el usuario tiene acceso al deployment
+    dep = await get_deployment(prisma, deployment_id, user_id)
+    if not dep:
+        return []
+        
     return await prisma.deploymentevent.find_many(
         where={"deployment_id": deployment_id},
         order={"created_at": "asc"},  # ascendente para la timeline del frontend
@@ -99,8 +107,9 @@ async def create_deployment(
     # Para la demo, si el user_id no existe en auth.users (como el mock token), 
     # evitamos enviarlo para no romper la llave foránea de user_profiles.
     # El nombre "Operador DS2" se mantiene para la UI.
-    db_user_id = None 
-    # En producción real con JWT verificado, usaríamos: db_user_id = user_id
+    # Usamos el user_id proporcionado si es un UUID válido (el token mock)
+    # Esto garantiza que el campo requested_by_user_id se pueble en la DB.
+    db_user_id = user_id 
 
     queue_name = get_queue_name(deployment_in.environment.value)
 
@@ -203,7 +212,7 @@ async def update_deployment_status(
     status_update: DeploymentStatusUpdate,
     user_id: str = None,
 ):
-    deployment = await get_deployment(prisma, deployment_id)
+    deployment = await get_deployment(prisma, deployment_id, user_id)
     if not deployment:
         return None
 
@@ -271,7 +280,7 @@ async def promote_to_production(prisma: Prisma, deployment_id: str, user_id: str
     Crea un nuevo deployment en producción basado en uno exitoso de staging.
     Solo se puede promover si el deployment de origen es SUCCESS en staging.
     """
-    source = await get_deployment(prisma, deployment_id)
+    source = await get_deployment(prisma, deployment_id, user_id)
     if not source:
         return None, "Deployment origen no encontrado"
     if source.status != PrismaDeploymentStatus.SUCCESS:
@@ -289,6 +298,9 @@ async def promote_to_production(prisma: Prisma, deployment_id: str, user_id: str
         policy=DeploymentPolicy[source.policy] if hasattr(source, "policy") else DeploymentPolicy.replace,
         k8s_namespace=source.k8s_namespace,
         k8s_resource_name=source.k8s_resource_name,
+        health_path=source.health_path,
+        container_port=source.container_port,
+        env_vars=source.env_vars,
     )
 
     new_deployment = await create_deployment(prisma, new_dep_in, user_id)
@@ -321,7 +333,7 @@ async def trigger_rollback(prisma: Prisma, deployment_id: str, reason: str = Non
     """
     from app.integrations.rabbitmq import rabbitmq_client
 
-    deployment = await get_deployment(prisma, deployment_id)
+    deployment = await get_deployment(prisma, deployment_id, user_id)
     if not deployment:
         return None, "Deployment no encontrado"
 
@@ -376,7 +388,7 @@ async def trigger_rollback(prisma: Prisma, deployment_id: str, reason: str = Non
 
 async def cancel_deployment(prisma: Prisma, deployment_id: str, user_id: str = None):
     """Cancela un deployment si aún está en espera."""
-    dep = await prisma.deployment.find_unique(where={"id": deployment_id})
+    dep = await get_deployment(prisma, deployment_id, user_id)
     if not dep:
         return None, "Deployment no encontrado"
     
@@ -403,9 +415,12 @@ async def cancel_deployment(prisma: Prisma, deployment_id: str, user_id: str = N
 # Estadísticas para el Paper (Métricas Operativas)
 # ---------------------------------------------------------------------------
 
-async def get_deployment_stats(prisma: Prisma):
-    """Calcula métricas clave de desempeño."""
-    all_deps = await prisma.deployment.find_many()
+async def get_deployment_stats(prisma: Prisma, user_id: str = None):
+    """Calcula métricas clave de desempeño filtradas por usuario."""
+    where = {}
+    if user_id:
+        where["requested_by_user_id"] = user_id
+    all_deps = await prisma.deployment.find_many(where=where)
     
     total = len(all_deps)
     if total == 0:

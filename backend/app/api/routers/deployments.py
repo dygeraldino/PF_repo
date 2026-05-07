@@ -82,11 +82,14 @@ async def list_deployments(
     status: Optional[DeploymentStatus] = Query(None),
     environment: Optional[str] = Query(None),
     service_name: Optional[str] = Query(None),
-    user_id: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     prisma: Prisma = Depends(get_prisma),
+    user_id: str = Depends(get_current_user_id),
 ):
-    """Lista deployments con filtros opcionales."""
+    """Lista deployments del usuario autenticado."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
     results = await deployment_service.list_deployments(
         prisma,
         status=status.value if status else None,
@@ -108,15 +111,22 @@ async def get_stats(
     user_id: Optional[str] = Depends(get_current_user_id),
 ):
     """Obtiene estadísticas globales de despliegues para el análisis del paper."""
-    return await deployment_service.get_deployment_stats(prisma)
+    return await deployment_service.get_deployment_stats(prisma, user_id)
 
 
 @router.get("/{id}", response_model=DeploymentResponse)
-async def get_deployment(id: str, prisma: Prisma = Depends(get_prisma)):
-    """Detalle de un deployment."""
-    dep = await deployment_service.get_deployment(prisma, id)
+async def get_deployment(
+    id: str, 
+    prisma: Prisma = Depends(get_prisma),
+    user_id: str = Depends(get_current_user_id)
+):
+    """Detalle de un deployment (solo si el usuario es el dueño)."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="No autorizado")
+        
+    dep = await deployment_service.get_deployment(prisma, id, user_id)
     if not dep:
-        raise HTTPException(status_code=404, detail="Deployment no encontrado")
+        raise HTTPException(status_code=404, detail="Deployment no encontrado o acceso denegado")
     return DeploymentResponse(**_to_deployment_response(dep))
 
 
@@ -146,20 +156,25 @@ async def create_deployment_event(
     user_id: Optional[str] = Depends(get_current_user_id),
 ):
     """Registra un evento de trazabilidad manual."""
-    dep = await deployment_service.get_deployment(prisma, id)
+    dep = await deployment_service.get_deployment(prisma, id, user_id)
     if not dep:
-        raise HTTPException(status_code=404, detail="Deployment no encontrado")
+        raise HTTPException(status_code=404, detail="Deployment no encontrado o acceso denegado")
     event = await deployment_service.log_event(prisma, id, event_in, user_id)
     return DeploymentEventResponse(**_to_event_response(event))
 
 
 @router.get("/{id}/events", response_model=List[DeploymentEventResponse])
-async def get_deployment_events(id: str, prisma: Prisma = Depends(get_prisma)):
-    """Historial de eventos de un deployment (ordenado cronológicamente)."""
-    dep = await deployment_service.get_deployment(prisma, id)
-    if not dep:
-        raise HTTPException(status_code=404, detail="Deployment no encontrado")
-    events = await deployment_service.get_deployment_events(prisma, id)
+async def get_deployment_events(
+    id: str, 
+    prisma: Prisma = Depends(get_prisma),
+    user_id: str = Depends(get_current_user_id)
+):
+    """Historial de eventos de un deployment (solo si el usuario es el dueño)."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    events = await deployment_service.get_deployment_events(prisma, id, user_id)
+    # Si get_deployment_events retorna lista vacía por falta de acceso, el frontend lo manejará.
     return [DeploymentEventResponse(**_to_event_response(e)) for e in events]
 
 
