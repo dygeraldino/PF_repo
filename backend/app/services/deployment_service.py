@@ -26,9 +26,6 @@ async def log_event(
     actor_user_id: str = None,
 ):
     """Registra un evento de trazabilidad."""
-    # Para la demo, evitamos violaciones de FK si el usuario no es real
-    db_actor_id = None # db_actor_id = actor_user_id en prod real
-    
     # Convertir strings de Pydantic a Enums de Prisma explícitamente
     data = {
         "deployment": {"connect": {"id": deployment_id}},
@@ -42,7 +39,8 @@ async def log_event(
     if event_data.details is not None:
         data["details"] = Json(event_data.details)
         
-    data["actor_user_id"] = db_actor_id
+    if actor_user_id:
+        data["actor_user_id"] = actor_user_id
 
     return await prisma.deploymentevent.create(data=data)
 
@@ -104,13 +102,6 @@ async def create_deployment(
 ):
     from app.integrations.rabbitmq import rabbitmq_client, get_queue_name
 
-    # Para la demo, si el user_id no existe en auth.users (como el mock token), 
-    # evitamos enviarlo para no romper la llave foránea de user_profiles.
-    # El nombre "Operador DS2" se mantiene para la UI.
-    # Usamos el user_id proporcionado si es un UUID válido (el token mock)
-    # Esto garantiza que el campo requested_by_user_id se pueble en la DB.
-    db_user_id = user_id 
-
     queue_name = get_queue_name(deployment_in.environment.value)
 
     # 1. Crear con estado PENDING
@@ -120,8 +111,8 @@ async def create_deployment(
         "environment": PrismaDeploymentEnvironment(deployment_in.environment.value),
         "policy": PrismaDeploymentPolicy(deployment_in.policy.value),
         "status": PrismaDeploymentStatus.PENDING,
-        "requested_by_user_id": db_user_id,
-        "requested_by_name": "Operador DS2", # Poblamos el nombre para el paper
+        "requested_by_user_id": user_id,
+        "requested_by_name": "Usuario Autenticado",
         "k8s_namespace": deployment_in.k8s_namespace,
         "k8s_resource_name": deployment_in.k8s_resource_name,
         "health_path": deployment_in.health_path,
