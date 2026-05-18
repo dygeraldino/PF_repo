@@ -8,7 +8,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-  - host: {{ service_name }}.paas.local
+  - host: {{ service_name }}.13.86.117.95.sslip.io
     http:
       paths:
       - path: /
