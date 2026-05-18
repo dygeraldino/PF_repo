@@ -13,5 +13,5 @@ nodes:
     hostPort: 11000
     protocol: TCP
   - containerPort: 443
-    hostPort: 443
+    hostPort: 11443
     protocol: TCP
