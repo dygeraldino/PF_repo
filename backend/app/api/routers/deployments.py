@@ -1,13 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from prisma import Prisma
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from prisma import Prisma, Json
 from pydantic import BaseModel
 from typing import List, Optional
 
 from app.core.database import get_prisma
-from app.schemas.deployment import DeploymentCreate, DeploymentResponse, DeploymentStatusUpdate
+from app.schemas.deployment import DeploymentCreate, DeploymentResponse, DeploymentStatusUpdate, RepoDeployRequest
 from app.schemas.event import DeploymentEventCreate, DeploymentEventResponse
 from app.schemas.enums import DeploymentStatus
 from app.services import deployment_service
+from app.services.repo_service import process_repo_deployment
 from app.api.dependencies import get_current_user_id
 
 router = APIRouter(prefix="/deployments", tags=["deployments"])
@@ -75,6 +76,99 @@ async def create_deployment(
     """Crea una solicitud de despliegue y la encola en RabbitMQ."""
     result = await deployment_service.create_deployment(prisma, deployment_in, user_id)
     return DeploymentResponse(**_to_deployment_response(result))
+
+
+@router.post("/from-repo", status_code=202)
+async def create_deployment_from_repo(
+    request: RepoDeployRequest,
+    background_tasks: BackgroundTasks,
+    prisma: Prisma = Depends(get_prisma),
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """
+    Clona un repositorio, construye la imagen y la carga en Kind en background.
+    """
+    import asyncio
+    from prisma.enums import DeploymentEnvironment as PrismaDeploymentEnvironment
+    from prisma.enums import DeploymentPolicy as PrismaDeploymentPolicy
+    from prisma.enums import DeploymentStatus as PrismaDeploymentStatus
+    from app.services.deployment_service import log_event
+    from app.schemas.event import DeploymentEventCreate
+    
+    if not user_id:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    check_proc = await asyncio.create_subprocess_shell(
+        "kind get clusters",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await check_proc.communicate()
+    existing_clusters = stdout.decode().strip().split('\n')
+    
+    msg = "Proceso de clonado y despliegue iniciado en segundo plano"
+    if request.cluster_name in existing_clusters:
+        msg = f"Aviso: El cluster '{request.cluster_name}' ya existe y será reutilizado. " + msg
+
+    # 1. Crear el registro del deployment inmediatamente
+    full_image_name = f"{request.image_name}:{request.image_version}"
+    
+    parsed_env_vars = {}
+    if request.env_file_content:
+        for line in request.env_file_content.strip().split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, val = line.split('=', 1)
+                parsed_env_vars[key.strip()] = val.strip().strip('"').strip("'")
+
+    new_deployment = await prisma.deployment.create(data={
+        "service_name": request.service_name,
+        "image": full_image_name,
+        "environment": PrismaDeploymentEnvironment.staging,
+        "policy": PrismaDeploymentPolicy.replace,
+        "status": PrismaDeploymentStatus.PENDING,
+        "requested_by_user_id": user_id,
+        "requested_by_name": "Usuario Autenticado",
+        "k8s_namespace": "staging-ns",
+        "k8s_resource_name": request.service_name,
+        "health_path": "/",
+        "container_port": 80,
+        "queue_name": "staging_queue",
+        "env_vars": Json(parsed_env_vars),
+    })
+
+    # 2. Registrar el primer evento del seguimiento
+    await log_event(
+        prisma, new_deployment.id,
+        DeploymentEventCreate(
+            event_type="REQUEST_CREATED",
+            event_status="PENDING",
+            source="API",
+            message=f"Solicitud recibida. {msg}. Iniciando clonado y compilación.",
+            details={"repo": request.repo_url, "image": full_image_name, "cluster": request.cluster_name},
+        ),
+        actor_user_id=user_id,
+    )
+
+    # 3. Lanzar tarea en segundo plano
+    background_tasks.add_task(
+        process_repo_deployment,
+        deployment_id=new_deployment.id,
+        repo_url=request.repo_url,
+        docker_context_path=request.docker_context_path,
+        service_name=request.service_name,
+        cluster_name=request.cluster_name,
+        image_name=request.image_name,
+        image_version=request.image_version,
+        env_file_content=request.env_file_content,
+    )
+    return {
+        "id": new_deployment.id,
+        "message": msg,
+        "status": "processing"
+    }
 
 
 @router.get("", response_model=List[DeploymentResponse])

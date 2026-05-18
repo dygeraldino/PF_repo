@@ -43,3 +43,8 @@ docker-compose.override.yml
 # Prisma
 # El cliente se genera en site-packages por defecto, pero si se genera localmente:
 schema.prisma.backup
+
+# Big binary files / local exports
+*.tar
+*.tar.gz
+

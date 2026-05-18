@@ -18,6 +18,15 @@ class DeploymentBase(BaseModel):
 class DeploymentCreate(DeploymentBase):
     pass
 
+class RepoDeployRequest(BaseModel):
+    repo_url: str = Field(..., description="URL of the Git repository to clone")
+    docker_context_path: str = Field(default=".", description="Path inside the repo where the Dockerfile is located")
+    service_name: str = Field(..., description="Name of the service (used for Kubernetes deployment/ingress)")
+    cluster_name: str = Field(default="paas-demo")
+    image_name: str = Field(..., description="Name for the built Docker image")
+    image_version: str = Field(default="latest")
+    env_file_content: Optional[str] = Field(default=None, description="Content of .env file needed for build")
+
 class DeploymentStatusUpdate(BaseModel):
     status: DeploymentStatus
     success: Optional[bool] = None

@@ -118,7 +118,7 @@ async def create_deployment(
         "health_path": deployment_in.health_path,
         "container_port": deployment_in.container_port,
         "queue_name": queue_name,
-        "env_vars": Json(deployment_in.env_vars) if deployment_in.env_vars else None,
+        "env_vars": Json(deployment_in.env_vars if deployment_in.env_vars is not None else {}),
     })
 
     # 2. Evento: REQUEST_CREATED
@@ -134,30 +134,61 @@ async def create_deployment(
         actor_user_id=user_id,
     )
 
-    # 3. Publicar en RabbitMQ
+    # 3. Encolar asíncronamente
+    return await enqueue_deployment(prisma, new_deployment.id, user_id)
+
+
+async def enqueue_deployment(
+    prisma: Prisma, deployment_id: str, user_id: str = None
+):
+    from app.integrations.rabbitmq import rabbitmq_client, get_queue_name
+    from datetime import datetime, timezone
+
+    # 1. Obtener el deployment actual
+    deployment = await prisma.deployment.find_unique(where={"id": deployment_id})
+    if not deployment:
+        raise ValueError(f"Deployment {deployment_id} no encontrado")
+
+    queue_name = get_queue_name(deployment.environment)
+
+    # 2. Publicar en RabbitMQ
     now = datetime.now(timezone.utc)
     message_id = None
     try:
+        # En caso de env_vars, prisma-client-py lo mapea como Json. En Python es dict/list o None.
+        # env_vars puede ser devuelto como un diccionario o string parsed.
+        import json
+        env_vars_dict = {}
+        if deployment.env_vars:
+            try:
+                # Si viene como string serializado
+                if isinstance(deployment.env_vars, str):
+                    env_vars_dict = json.loads(deployment.env_vars)
+                else:
+                    env_vars_dict = dict(deployment.env_vars)
+            except Exception:
+                env_vars_dict = {}
+
         payload = {
-            "deployment_id": new_deployment.id,
-            "service_name": new_deployment.service_name,
-            "image": new_deployment.image,
-            "environment": new_deployment.environment,
-            "policy": new_deployment.policy,
+            "deployment_id": deployment.id,
+            "service_name": deployment.service_name,
+            "image": deployment.image,
+            "environment": deployment.environment,
+            "policy": deployment.policy,
             "requested_by_user_id": user_id,
-            "k8s_namespace": deployment_in.k8s_namespace or f"{deployment_in.environment.value}-ns",
-            "k8s_resource_name": deployment_in.k8s_resource_name or deployment_in.service_name,
-            "health_path": deployment_in.health_path or "/health",
-            "container_port": deployment_in.container_port or 8000,
-            "env_vars": deployment_in.env_vars,
+            "k8s_namespace": deployment.k8s_namespace or f"{deployment.environment}-ns",
+            "k8s_resource_name": deployment.k8s_resource_name or deployment.service_name,
+            "health_path": deployment.health_path or "/health",
+            "container_port": deployment.container_port or 8000,
+            "env_vars": env_vars_dict,
             "requested_at": str(now),
         }
         message_id = await rabbitmq_client.publish_deployment(payload)
 
     except Exception as exc:
-        logger.error(f"No se pudo publicar en RabbitMQ para {new_deployment.id}: {exc}")
+        logger.error(f"No se pudo publicar en RabbitMQ para {deployment.id}: {exc}")
         await log_event(
-            prisma, new_deployment.id,
+            prisma, deployment.id,
             DeploymentEventCreate(
                 event_type="ERROR",
                 event_status="PENDING",
@@ -165,11 +196,11 @@ async def create_deployment(
                 message=f"Error al encolar en RabbitMQ: {str(exc)[:200]}. El deployment permanece en PENDING.",
             ),
         )
-        return new_deployment
+        return deployment
 
-    # 4. Actualizar a QUEUED con timestamps y message_id
+    # 3. Actualizar a QUEUED con timestamps y message_id
     updated = await prisma.deployment.update(
-        where={"id": new_deployment.id},
+        where={"id": deployment.id},
         data={
             "status": PrismaDeploymentStatus.QUEUED,
             "queued_at": now,
@@ -177,7 +208,7 @@ async def create_deployment(
         },
     )
 
-    # 5. Evento: ENQUEUED
+    # 4. Evento: ENQUEUED
     await log_event(
         prisma, updated.id,
         DeploymentEventCreate(

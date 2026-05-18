@@ -25,7 +25,7 @@ class KubernetesClient:
 
         if not simulate:
             try:
-                # Intenta cargar config interna (si el backend corre en K8s) 
+                # Intenta cargar config interna (si el backend corre en K8s)
                 # o externa (vía ~/.kube/config mapeado)
                 try:
                     config.load_incluster_config()
@@ -33,23 +33,30 @@ class KubernetesClient:
                 except config.ConfigException:
                     config.load_kube_config()
                     logger.info("✔ K8s: Usando configuración KubeConfig local")
-                
+
                 # Overwrite server URL if specified (useful for Docker-to-Kind)
+                # IMPORTANTE: Se modifica la configuración default en lugar de reemplazarla
+                # para preservar los certificados TLS y credenciales cargadas desde kubeconfig.
                 server_override = os.getenv("K8S_SERVER_OVERRIDE")
                 if server_override:
+                    # get_default_copy() retorna una copia con las credenciales ya cargadas.
+                    # Mutamos esa copia y la establecemos como default ANTES de crear los clientes.
                     conf = client.Configuration.get_default_copy()
                     conf.host = server_override
-                    conf.verify_ssl = False # Kind certs use internal IPs, skip verify to avoid SAN errors
+                    conf.verify_ssl = False  # Kind usa IPs internas; omitir verificación SAN
+                    conf.ssl_ca_cert = None  # No se necesita CA externa; verify_ssl=False lo cubre
                     client.Configuration.set_default(conf)
-                    logger.info(f"⚠ K8s: Server URL sobreescrita a {server_override} (SSL Verify=False)")
+                    logger.info(f"⚠ K8s: Server URL sobreescrita a {server_override} (SSL Verify=False, credenciales preservadas)")
 
-                self.apps_v1 = client.AppsV1Api()
-                self.core_v1 = client.CoreV1Api()
-                self.networking_v1 = client.NetworkingV1Api()
-                self.api_client = client.ApiClient()
+                # Crear un ApiClient explícito desde la configuración default ya modificada.
+                # Esto garantiza que los tres clientes de API comparten la misma sesión autenticada.
+                self.api_client = client.ApiClient(configuration=client.Configuration.get_default_copy())
+                self.apps_v1 = client.AppsV1Api(api_client=self.api_client)
+                self.core_v1 = client.CoreV1Api(api_client=self.api_client)
+                self.networking_v1 = client.NetworkingV1Api(api_client=self.api_client)
             except Exception as e:
                 logger.error(f"❌ Error al inicializar cliente real de K8s: {e}")
-                self.simulate = True # Fallback a simulación si falla la conexión
+                self.simulate = True  # Fallback a simulación si falla la conexión
 
     async def apply_deployment(
         self, namespace: str, resource_name: str, image: str, policy: str, service_name: str,

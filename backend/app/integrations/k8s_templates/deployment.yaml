@@ -19,14 +19,14 @@ spec:
       containers:
       - name: app
         image: {{ image }}
-        imagePullPolicy: IfNotPresent # Ideal para Kind (usando kind load)
-        {% if env_vars %}
+        imagePullPolicy: IfNotPresent
+        {%- if env_vars %}
         env:
-        {% for key, value in env_vars.items() %}
-        - name: {{ key }}
-          value: "{{ value }}"
-        {% endfor %}
-        {% endif %}
+        {%- for key, value in env_vars.items() %}
+          - name: {{ key }}
+            value: "{{ value }}"
+        {%- endfor %}
+        {%- endif %}
         ports:
         - containerPort: {{ port | default(8000) }}
         resources:
@@ -40,5 +40,13 @@ spec:
           httpGet:
             path: {{ health_path | default('/health') }}
             port: {{ port | default(8000) }}
-          initialDelaySeconds: 5
-          periodSeconds: 20
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: {{ health_path | default('/health') }}
+            port: {{ port | default(8000) }}
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 6
