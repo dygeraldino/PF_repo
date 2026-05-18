@@ -424,10 +424,13 @@ async def cancel_deployment(prisma: Prisma, deployment_id: str, user_id: str = N
     
     await log_event(
         prisma, deployment_id, 
-        DeploymentEventType.FINISHED, 
-        PrismaDeploymentStatus.CANCELLED,
-        "Deployment cancelado por el usuario",
-        user_id=user_id
+        DeploymentEventCreate(
+            event_type="FINISHED",
+            event_status="CANCELLED",
+            source="API",
+            message="Deployment cancelado por el usuario",
+        ),
+        actor_user_id=user_id
     )
     
     return updated, None
