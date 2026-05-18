@@ -30,7 +30,7 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-      - ${HOME:-~}/.kube/config:/root/.kube/config:ro
+      - ~/.kube/config:/root/.kube/config:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - kind
@@ -46,7 +46,7 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-      - ${HOME:-~}/.kube/config:/root/.kube/config:ro
+      - ~/.kube/config:/root/.kube/config:ro
     networks:
       - kind
     command: python -m app.workers.deployment_worker
