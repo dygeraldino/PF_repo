@@ -28,3 +28,8 @@ class DeploymentEventType(str, enum.Enum):
     ROLLBACK_FAIL = 'ROLLBACK_FAIL'
     FINISHED = 'FINISHED'
     ERROR = 'ERROR'
+
+class UserRole(str, enum.Enum):
+    developer = 'developer'
+    operator = 'operator'
+    admin = 'admin'

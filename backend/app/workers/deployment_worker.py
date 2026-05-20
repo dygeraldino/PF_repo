@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import uuid
+import re
 from datetime import datetime, timezone
 
 import aio_pika
@@ -58,6 +59,18 @@ QUEUE_DLQ = "deployments.dlq"
 
 WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
 MAX_HEALTH_CHECKS = 10
+
+
+def _to_k8s_name(value: str, fallback: str = "app") -> str:
+    """Normalize a string to a DNS-1123 compatible name for Kubernetes."""
+    if not value:
+        return fallback
+    normalized = value.lower()
+    normalized = re.sub(r"[^a-z0-9.-]", "-", normalized)
+    normalized = re.sub(r"-+", "-", normalized)
+    normalized = re.sub(r"^[^a-z0-9]+", "", normalized)
+    normalized = re.sub(r"[^a-z0-9]+$", "", normalized)
+    return normalized or fallback
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +143,13 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
 
     is_rollback = payload.get("is_rollback", False)
 
-    logger.info(f"▶ Procesando deployment {deployment_id} ({service_name} → {environment}){' [ROLLBACK]' if is_rollback else ''}")
+    safe_service_name = _to_k8s_name(service_name)
+    safe_resource_name = _to_k8s_name(resource_name, fallback=safe_service_name)
+
+    logger.info(
+        f"▶ Procesando deployment {deployment_id} ({service_name} → {environment})"
+        f"{' [ROLLBACK]' if is_rollback else ''}"
+    )
 
     try:
         # Si es un rollback solicitado manualmente, primero debemos encontrar la imagen a la cual volver
@@ -167,7 +186,7 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
 
         # 2. Aplicar en Kubernetes
         apply_result = await k8s.apply_deployment(
-            namespace, resource_name, image, policy, service_name,
+            namespace, safe_resource_name, image, policy, safe_service_name,
             health_path=health_path, port=container_port,
             env_vars=env_vars
         )
@@ -185,7 +204,7 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
         rollout_ok = False
         for attempt in range(1, MAX_HEALTH_CHECKS + 1):
             logger.info(f"Health check {attempt}/{MAX_HEALTH_CHECKS} para {deployment_id}")
-            status_result = await k8s.check_rollout_status(namespace, resource_name)
+            status_result = await k8s.check_rollout_status(namespace, safe_resource_name)
 
             if status_result["ready"]:
                 rollout_ok = True
@@ -254,7 +273,7 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
                 )
                 
                 rollback_result = await k8s.apply_deployment(
-                    namespace, resource_name, last_success.image, "replace", service_name,
+                    namespace, safe_resource_name, last_success.image, "replace", safe_service_name,
                     health_path=health_path, 
                     port=container_port,
                     env_vars=last_success.env_vars
@@ -265,7 +284,7 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
                     logger.info(f"Esperando salud del rollback para {service_name}...")
                     rb_ok = False
                     for rb_attempt in range(1, 6):
-                        rb_status = await k8s.check_rollout_status(namespace, resource_name)
+                        rb_status = await k8s.check_rollout_status(namespace, safe_resource_name)
                         if rb_status["ready"]:
                             rb_ok = True
                             break

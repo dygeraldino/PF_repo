@@ -119,6 +119,7 @@ async def create_deployment(
         "container_port": deployment_in.container_port,
         "queue_name": queue_name,
         "env_vars": Json(deployment_in.env_vars if deployment_in.env_vars is not None else {}),
+        "previous_deployment_id": deployment_in.previous_deployment_id,
     })
 
     # 2. Evento: REQUEST_CREATED
@@ -323,6 +324,7 @@ async def promote_to_production(prisma: Prisma, deployment_id: str, user_id: str
         health_path=source.health_path,
         container_port=source.container_port,
         env_vars=source.env_vars,
+        previous_deployment_id=source.id,
     )
 
     new_deployment = await create_deployment(prisma, new_dep_in, user_id)

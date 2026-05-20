@@ -16,7 +16,10 @@ class DeploymentBase(BaseModel):
     env_vars: Optional[dict] = None
 
 class DeploymentCreate(DeploymentBase):
-    pass
+    previous_deployment_id: Optional[str] = Field(
+        default=None,
+        description="ID del deployment anterior (si aplica)"
+    )
 
 class RepoDeployRequest(BaseModel):
     repo_url: str = Field(..., description="URL of the Git repository to clone")
@@ -63,6 +66,7 @@ class DeploymentResponse(BaseModel):
     success: Optional[bool] = None
     error_message: Optional[str] = None
     notes: Optional[str] = None
+    previous_deployment_id: Optional[str] = None
 
     created_at: datetime
     updated_at: datetime

@@ -39,6 +39,7 @@ def _to_deployment_response(d) -> dict:
         "k8s_namespace": d.k8s_namespace,
         "k8s_resource_name": d.k8s_resource_name,
         "rollout_revision": d.rollout_revision,
+        "previous_deployment_id": str(d.previous_deployment_id) if d.previous_deployment_id else None,
         "rollback_required": d.rollback_required,
         "rollback_performed": d.rollback_performed,
         "success": d.success,

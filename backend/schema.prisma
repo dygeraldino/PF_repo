@@ -108,6 +108,7 @@ model Deployment {
   k8s_namespace        String?               @db.VarChar(120)
   k8s_resource_name    String?               @db.VarChar(120)
   rollout_revision     Int?
+  previous_deployment_id String?            @db.Uuid
 
   rollback_required    Boolean               @default(false)
   rollback_performed   Boolean               @default(false)

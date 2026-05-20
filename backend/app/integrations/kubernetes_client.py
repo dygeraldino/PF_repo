@@ -84,6 +84,7 @@ class KubernetesClient:
                 "port": port,
                 "health_path": health_path,
                 "env_vars": env_vars,
+                "ingress_base_domain": settings.INGRESS_BASE_DOMAIN,
             }
 
             # Aplicar Deployment
