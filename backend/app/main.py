@@ -7,7 +7,7 @@ from prometheus_client import make_asgi_app
 from app.core.config import settings
 from app.core.database import prisma_client
 from app.integrations.rabbitmq import rabbitmq_client
-from app.api.routers import deployments, health, auth
+from app.api.routers import deployments, health, auth, teams
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(deployments.router)
 app.include_router(auth.router)
+app.include_router(teams.router)
 
 # Expose metrics for Prometheus
 metrics_app = make_asgi_app()

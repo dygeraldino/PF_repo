@@ -5,7 +5,7 @@ from prisma.enums import (
     DeploymentEnvironment as PrismaDeploymentEnvironment,
     DeploymentPolicy as PrismaDeploymentPolicy,
 )
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timezone
 import logging
 
@@ -49,10 +49,25 @@ async def log_event(
 # CRUD
 # ---------------------------------------------------------------------------
 
+async def _get_team_user_ids(prisma: Prisma, user_id: Optional[str]) -> Optional[List[str]]:
+    if not user_id:
+        return None
+    profile = await prisma.userprofile.find_unique(where={"id": user_id})
+    if not profile or not profile.team:
+        return [user_id]
+
+    members = await prisma.userprofile.find_many(
+        where={"team": profile.team}
+    )
+    member_ids = [m.id for m in members if m.id]
+    return member_ids or [user_id]
+
 async def get_deployment(prisma: Prisma, deployment_id: str, user_id: str = None):
     where = {"id": deployment_id}
     if user_id:
-        where["requested_by_user_id"] = user_id
+        allowed_ids = await _get_team_user_ids(prisma, user_id)
+        if allowed_ids:
+            where["requested_by_user_id"] = {"in": allowed_ids}
     return await prisma.deployment.find_unique(where=where)
 
 
@@ -72,7 +87,9 @@ async def list_deployments(
     if service_name:
         where["service_name"] = {"contains": service_name}
     if user_id:
-        where["requested_by_user_id"] = user_id
+        allowed_ids = await _get_team_user_ids(prisma, user_id)
+        if allowed_ids:
+            where["requested_by_user_id"] = {"in": allowed_ids}
 
     return await prisma.deployment.find_many(
         where=where,
@@ -442,43 +459,164 @@ async def cancel_deployment(prisma: Prisma, deployment_id: str, user_id: str = N
 # Estadísticas para el Paper (Métricas Operativas)
 # ---------------------------------------------------------------------------
 
-async def get_deployment_stats(prisma: Prisma, user_id: str = None):
-    """Calcula métricas clave de desempeño filtradas por usuario."""
-    where = {}
-    if user_id:
-        where["requested_by_user_id"] = user_id
-    all_deps = await prisma.deployment.find_many(where=where)
-    
-    total = len(all_deps)
+def _deployment_end_time(dep, now: datetime) -> datetime:
+    return dep.finished_at or dep.updated_at or dep.started_at or dep.requested_at or now
+
+
+def _calculate_concurrent_deploys(deployments, now: datetime) -> int:
+    events = []
+    for dep in deployments:
+        if not dep.started_at:
+            continue
+        start = dep.started_at
+        end = dep.finished_at or now
+        events.append((start, 1))
+        events.append((end, -1))
+
+    if not events:
+        return 0
+
+    events.sort(key=lambda item: (item[0], item[1]))
+    current = 0
+    max_concurrent = 0
+    for _, delta in events:
+        current += delta
+        if current > max_concurrent:
+            max_concurrent = current
+    return max_concurrent
+
+
+def _calculate_mttr_minutes(deployments, now: datetime) -> float:
+    by_service_env = {}
+    for dep in deployments:
+        key = (dep.service_name, dep.environment)
+        by_service_env.setdefault(key, []).append(dep)
+
+    mttrs = []
+    for items in by_service_env.values():
+        items_sorted = sorted(items, key=lambda d: d.requested_at or now)
+        for idx, dep in enumerate(items_sorted):
+            # Caso A: Rollback Automático (el deployment falló en su ejecución principal y terminó en ROLLED_BACK)
+            if dep.status == PrismaDeploymentStatus.ROLLED_BACK:
+                start = dep.started_at or dep.requested_at
+                end = dep.finished_at
+                if start and end and end > start:
+                    mttrs.append((end - start).total_seconds() / 60)
+                continue
+
+            # Caso B: Rollback Manual (el deployment tiene rollback_required=True y terminó en SUCCESS con la versión previa)
+            if dep.status == PrismaDeploymentStatus.SUCCESS and dep.rollback_required:
+                start = dep.queued_at or dep.started_at or dep.requested_at
+                end = dep.finished_at
+                if start and end and end > start:
+                    mttrs.append((end - start).total_seconds() / 60)
+                continue
+
+            # Caso C: Fallo Permanente (el deployment quedó en FAILED)
+            if dep.status == PrismaDeploymentStatus.FAILED:
+                failure_time = dep.finished_at or dep.updated_at or dep.requested_at
+                # Buscar el siguiente deployment exitoso posterior a este fallo
+                for next_dep in items_sorted[idx + 1:]:
+                    if next_dep.status == PrismaDeploymentStatus.SUCCESS:
+                        recovery_time = next_dep.finished_at or next_dep.started_at
+                        if recovery_time and recovery_time > failure_time:
+                            mttrs.append((recovery_time - failure_time).total_seconds() / 60)
+                        break
+
+    if not mttrs:
+        return 0.0
+    return sum(mttrs) / len(mttrs)
+
+
+def calculate_deployment_stats(deployments, now: Optional[datetime] = None) -> dict:
+    now = now or datetime.now(timezone.utc)
+    total = len(deployments)
     if total == 0:
         return {
             "total_deployments": 0,
             "success_rate": 0,
             "avg_duration_seconds": 0,
             "rollback_count": 0,
-            "mttr_minutes": 0
+            "mttr_minutes": 0,
+            "concurrent_deploys": 0
         }
 
-    success = [d for d in all_deps if d.status == PrismaDeploymentStatus.SUCCESS]
-    rollbacks = [d for d in all_deps if d.rollback_performed or d.status == PrismaDeploymentStatus.ROLLED_BACK]
-    
-    # Duración promedio
+    success = [d for d in deployments if d.status == PrismaDeploymentStatus.SUCCESS]
+    rollbacks = [
+        d for d in deployments
+        if d.rollback_performed or d.status == PrismaDeploymentStatus.ROLLED_BACK
+    ]
+
     durations = []
     for d in success:
         if d.started_at and d.finished_at:
             delta = (d.finished_at - d.started_at).total_seconds()
             durations.append(delta)
-    
-    avg_duration = sum(durations) / len(durations) if durations else 0
 
-    # MTTR (Tiempo medio de recuperación)
-    # Lo calculamos como el tiempo entre un FAILED y el siguiente SUCCESS del mismo servicio
-    mttrs = []
-    # Lógica simplificada para el dashboard
+    avg_duration = sum(durations) / len(durations) if durations else 0
+    mttr_minutes = _calculate_mttr_minutes(deployments, now)
+    concurrent_deploys = _calculate_concurrent_deploys(deployments, now)
+
     return {
         "total_deployments": total,
         "success_rate": round((len(success) / total) * 100, 1),
         "avg_duration_seconds": round(avg_duration, 1),
         "rollback_count": len(rollbacks),
-        "mttr_minutes": 1.5 # Valor base para la demo si no hay fallos previos
+        "mttr_minutes": round(mttr_minutes, 2),
+        "concurrent_deploys": concurrent_deploys
     }
+
+async def get_deployment_stats(prisma: Prisma, user_id: str = None):
+    """Calcula métricas clave de desempeño filtradas por usuario."""
+    where = {}
+    if user_id:
+        allowed_ids = await _get_team_user_ids(prisma, user_id)
+        if allowed_ids:
+            where["requested_by_user_id"] = {"in": allowed_ids}
+    all_deps = await prisma.deployment.find_many(where=where)
+    return calculate_deployment_stats(all_deps)
+
+
+async def list_team_services(prisma: Prisma, user_id: str) -> List[str]:
+    allowed_ids = await _get_team_user_ids(prisma, user_id)
+    if not allowed_ids:
+        return []
+
+    deployments = await prisma.deployment.find_many(
+        where={"requested_by_user_id": {"in": allowed_ids}},
+        order={"requested_at": "desc"}
+    )
+
+    services = []
+    seen = set()
+    for dep in deployments:
+        name = dep.service_name
+        if name and name not in seen:
+            services.append(name)
+            seen.add(name)
+    return services
+
+
+async def list_team_service_images(prisma: Prisma, user_id: str, service_name: str) -> List[str]:
+    if not service_name:
+        return []
+    allowed_ids = await _get_team_user_ids(prisma, user_id)
+    if not allowed_ids:
+        return []
+
+    deployments = await prisma.deployment.find_many(
+        where={
+            "requested_by_user_id": {"in": allowed_ids},
+            "service_name": service_name,
+        },
+        order={"requested_at": "desc"}
+    )
+
+    images = []
+    seen = set()
+    for dep in deployments:
+        img = dep.image
+        if img and img not in seen:
+            images.append(img)
+            seen.add(img)
+    return images
