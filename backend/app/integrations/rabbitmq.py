@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 import logging
@@ -37,13 +38,24 @@ class RabbitMQClient:
     def is_connected(self) -> bool:
         return self._connection is not None and not self._connection.is_closed
 
-    async def connect(self):
-        """Conectar a RabbitMQ y declarar todas las colas necesarias."""
-        self._connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
-        self._channel = await self._connection.channel()
-        await self._channel.set_qos(prefetch_count=1)
-        await self._declare_queues()
-        logger.info("RabbitMQ conectado y colas declaradas")
+    async def connect(self, retries: int = 5, delay: float = 2.0):
+        """Conectar a RabbitMQ y declarar todas las colas necesarias, con reintentos en caso de fallo inicial."""
+        for attempt in range(1, retries + 1):
+            try:
+                self._connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
+                self._channel = await self._connection.channel()
+                await self._channel.set_qos(prefetch_count=1)
+                await self._declare_queues()
+                logger.info("RabbitMQ conectado y colas declaradas")
+                return
+            except Exception as e:
+                if attempt == retries:
+                    raise e
+                logger.warning(
+                    f"Intento {attempt}/{retries} de conexión a RabbitMQ fallido: {e}. "
+                    f"Reintentando en {delay} segundos..."
+                )
+                await asyncio.sleep(delay)
 
     async def disconnect(self):
         if self._connection and not self._connection.is_closed:
