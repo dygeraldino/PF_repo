@@ -58,9 +58,10 @@ class KubernetesClient:
                 logger.error(f"❌ Error al inicializar cliente real de K8s: {e}")
                 self.simulate = True  # Fallback a simulación si falla la conexión
 
+
     async def apply_deployment(
         self, namespace: str, resource_name: str, image: str, policy: str, service_name: str,
-        health_path: str = "/health", port: int = 8000, env_vars: dict = None
+        health_path: str = "/health", port: int = 8000, env_vars: dict = None, environment: str = None
     ) -> dict:
         """
         Genera y aplica los recursos (Deployment, Service, Ingress) usando plantillas.
@@ -74,6 +75,9 @@ class KubernetesClient:
             # 1. Asegurar que el namespace existe
             await self._ensure_namespace(namespace)
 
+            # Determinar el entorno (staging o production)
+            env = environment or ("production" if "production" in namespace or "prod" in namespace else "staging")
+
             # 2. Renderizar y aplicar cada componente
             template_vars = {
                 "resource_name": resource_name,
@@ -85,6 +89,7 @@ class KubernetesClient:
                 "health_path": health_path,
                 "env_vars": env_vars,
                 "ingress_base_domain": settings.INGRESS_BASE_DOMAIN,
+                "environment": env,
             }
 
             # Aplicar Deployment
@@ -122,10 +127,13 @@ class KubernetesClient:
             desired = dep.spec.replicas or 1
 
             # 2. Listar los pods actuales de este servicio
-            # Usamos el label app={{ service_name }} que definimos en el template
+            # Obtenemos dinámicamente el label 'app' desde el Deployment en el clúster
+            match_labels = dep.spec.selector.match_labels or {}
+            app_label = match_labels.get("app", resource_name)
+
             pods = self.core_v1.list_namespaced_pod(
                 namespace=namespace, 
-                label_selector=f"app={resource_name}"
+                label_selector=f"app={app_label}"
             )
 
             # 3. Contar cuántos pods con la imagen NUEVA están realmente Ready
@@ -183,22 +191,31 @@ class KubernetesClient:
                 try:
                     self.apps_v1.read_namespaced_deployment(name=name, namespace=namespace)
                     self.apps_v1.patch_namespaced_deployment(name=name, namespace=namespace, body=data)
-                except ApiException:
-                    self.apps_v1.create_namespaced_deployment(namespace=namespace, body=data)
+                except ApiException as e:
+                    if getattr(e, 'status', None) == 404:
+                        self.apps_v1.create_namespaced_deployment(namespace=namespace, body=data)
+                    else:
+                        raise
             
             elif kind == "Service":
                 try:
                     self.core_v1.read_namespaced_service(name=name, namespace=namespace)
                     self.core_v1.patch_namespaced_service(name=name, namespace=namespace, body=data)
-                except ApiException:
-                    self.core_v1.create_namespaced_service(namespace=namespace, body=data)
+                except ApiException as e:
+                    if getattr(e, 'status', None) == 404:
+                        self.core_v1.create_namespaced_service(namespace=namespace, body=data)
+                    else:
+                        raise
             
             elif kind == "Ingress":
                 try:
                     self.networking_v1.read_namespaced_ingress(name=name, namespace=namespace)
                     self.networking_v1.patch_namespaced_ingress(name=name, namespace=namespace, body=data)
-                except ApiException:
-                    self.networking_v1.create_namespaced_ingress(namespace=namespace, body=data)
+                except ApiException as e:
+                    if getattr(e, 'status', None) == 404:
+                        self.networking_v1.create_namespaced_ingress(namespace=namespace, body=data)
+                    else:
+                        raise
                     
         except ApiException as e:
             logger.error(f"Error aplicando {kind}/{name}: {e}")

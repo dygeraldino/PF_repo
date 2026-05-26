@@ -259,7 +259,7 @@ async def update_deployment_status(
     old_status = deployment.status
     now = datetime.now(timezone.utc)
 
-    update_data = {"status": PrismaDeploymentStatus[status_update.status.value]}
+    update_data = {"status": PrismaDeploymentStatus(status_update.status.value)}
 
     if status_update.success is not None:
         update_data["success"] = status_update.success
@@ -325,7 +325,7 @@ async def promote_to_production(prisma: Prisma, deployment_id: str, user_id: str
         return None, "Deployment origen no encontrado"
     if source.status != PrismaDeploymentStatus.SUCCESS:
         return None, f"Solo se puede promover un deployment exitoso (estado actual: {source.status})"
-    if source.environment != "staging":
+    if source.environment != PrismaDeploymentEnvironment.staging:
         return None, "Solo se pueden promover deployments de staging a production"
 
     from app.schemas.deployment import DeploymentCreate
@@ -335,7 +335,7 @@ async def promote_to_production(prisma: Prisma, deployment_id: str, user_id: str
         service_name=source.service_name,
         image=source.image,
         environment=DeploymentEnvironment.production,
-        policy=DeploymentPolicy[source.policy] if hasattr(source, "policy") else DeploymentPolicy.replace,
+        policy=DeploymentPolicy(source.policy) if hasattr(source, "policy") else DeploymentPolicy.replace,
         k8s_namespace=source.k8s_namespace,
         k8s_resource_name=source.k8s_resource_name,
         health_path=source.health_path,
@@ -385,7 +385,7 @@ async def trigger_rollback(prisma: Prisma, deployment_id: str, reason: str = Non
         prisma, deployment_id,
         DeploymentEventCreate(
             event_type="ROLLBACK_STARTED",
-            event_status=deployment.status,
+            event_status=deployment.status.value,
             source="API",
             message=f"Rollback manual iniciado. Razón: {note}",
         ),

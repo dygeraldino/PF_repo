@@ -29,6 +29,7 @@ class RepoDeployRequest(BaseModel):
     image_name: str = Field(..., description="Name for the built Docker image")
     image_version: str = Field(default="latest")
     env_file_content: Optional[str] = Field(default=None, description="Content of .env file needed for build")
+    is_compose: bool = Field(default=False, description="Whether to use docker-compose instead of Dockerfile")
 
 class DeploymentStatusUpdate(BaseModel):
     status: DeploymentStatus

@@ -1,0 +1,13 @@
+{
+  "total_deployments": 23,
+  "success_rate": 52.2,
+  "avg_duration_seconds": 13.2,
+  "rollback_count": 0,
+  "mttr_minutes": 6.28,
+  "concurrent_deploys": 1,
+  "period": {
+    "start": "2026-05-20T00:00:00+00:00",
+    "end": "2026-05-23T23:59:59+00:00"
+  },
+  "user_id": null
+}

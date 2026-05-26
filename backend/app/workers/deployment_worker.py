@@ -108,6 +108,21 @@ async def _set_status(prisma: Prisma, deployment_id: str, update_data: dict):
     await prisma.deployment.update(where={"id": deployment_id}, data=update_data)
 
 
+def _parse_env_vars(env_vars) -> dict:
+    """Asegura que env_vars sea un diccionario de Python válido (Prisma a veces lo retorna string)"""
+    if not env_vars:
+        return {}
+    if isinstance(env_vars, dict):
+        return env_vars
+    if isinstance(env_vars, str):
+        try:
+            return json.loads(env_vars)
+        except Exception:
+            return {}
+    return dict(env_vars)
+
+
+
 async def _record_metric(prisma: Prisma, deployment_id: str, name: str, value: float, unit: str = "seconds"):
     """Registra una métrica en la tabla deployment_metrics para el análisis estadístico."""
     try:
@@ -167,7 +182,7 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
             
             if last_success:
                 image = last_success.image
-                env_vars = last_success.env_vars
+                env_vars = _parse_env_vars(last_success.env_vars)
                 logger.info(f"↩ Imagen recuperada para rollback manual: {image}")
             else:
                 raise RuntimeError("No se encontró una versión anterior exitosa para realizar el rollback manual")
@@ -188,7 +203,7 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
         apply_result = await k8s.apply_deployment(
             namespace, safe_resource_name, image, policy, safe_service_name,
             health_path=health_path, port=container_port,
-            env_vars=env_vars
+            env_vars=env_vars, environment=environment
         )
 
         if not apply_result["success"]:
@@ -276,7 +291,8 @@ async def process_deployment(prisma: Prisma, k8s: KubernetesClient, payload: dic
                     namespace, safe_resource_name, last_success.image, "replace", safe_service_name,
                     health_path=health_path, 
                     port=container_port,
-                    env_vars=last_success.env_vars
+                    env_vars=_parse_env_vars(last_success.env_vars),
+                    environment=environment
                 )
                 
                 if rollback_result["success"]:
@@ -388,6 +404,8 @@ async def main():
 
     # Declarar colas en sus respectivos canales
     await channel_staging.declare_queue(QUEUE_DLQ, durable=True)
+    # La DLQ debe declararse en ambos canales para que RabbitMQ la reconozca
+    await channel_prod.declare_queue(QUEUE_DLQ, durable=True)
     
     staging_q = await channel_staging.declare_queue(
         QUEUE_STAGING, 

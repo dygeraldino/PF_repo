@@ -164,6 +164,8 @@ async def create_deployment_from_repo(
         image_name=request.image_name,
         image_version=request.image_version,
         env_file_content=request.env_file_content,
+        is_compose=request.is_compose,
+
     )
     return {
         "id": new_deployment.id,

@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Instalar Node.js, Git, Docker CLI, Kind y Kubectl
+# Instalar Node.js, Git, Docker CLI, Kind, Kubectl y Docker Compose
 RUN apt-get update \
     && apt-get install -y curl git docker.io \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -13,6 +13,11 @@ RUN apt-get update \
     && curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     && chmod +x kubectl \
     && mv kubectl /usr/local/bin/ \
+    && curl -L https://github.com/kubernetes/kompose/releases/download/v1.34.0/kompose-linux-amd64 -o kompose \
+    && chmod +x kompose \
+    && mv kompose /usr/local/bin/kompose \
+    && curl -SL "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose \
+    && chmod +x /usr/local/bin/docker-compose \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiar requirements e instalar

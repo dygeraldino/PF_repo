@@ -8,7 +8,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-  - host: {{ service_name }}.{{ ingress_base_domain }}
+  - host: {% if environment == 'staging' %}{{ service_name }}-staging{% else %}{{ service_name }}{% endif %}.{{ ingress_base_domain }}
     http:
       paths:
       - path: /
