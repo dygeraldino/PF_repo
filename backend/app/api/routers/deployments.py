@@ -45,6 +45,7 @@ def _to_deployment_response(d) -> dict:
         "success": d.success,
         "error_message": d.error_message,
         "notes": d.notes,
+        "is_compose": d.is_compose,
         "created_at": d.created_at,
         "updated_at": d.updated_at,
     }
@@ -138,6 +139,7 @@ async def create_deployment_from_repo(
         "container_port": 80,
         "queue_name": "staging_queue",
         "env_vars": Json(parsed_env_vars),
+        "is_compose": request.is_compose,
     })
 
     # 2. Registrar el primer evento del seguimiento

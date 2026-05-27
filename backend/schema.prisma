@@ -116,6 +116,7 @@ model Deployment {
   error_message        String?
   health_path          String?               @default("/health") @db.VarChar(255)
   container_port       Int                   @default(8000)
+  is_compose           Boolean               @default(false)
   env_vars             Json?
   notes                String?
 

@@ -137,6 +137,7 @@ async def create_deployment(
         "queue_name": queue_name,
         "env_vars": Json(deployment_in.env_vars if deployment_in.env_vars is not None else {}),
         "previous_deployment_id": deployment_in.previous_deployment_id,
+        "is_compose": deployment_in.is_compose or False,
     })
 
     # 2. Evento: REQUEST_CREATED
@@ -567,15 +568,22 @@ def calculate_deployment_stats(deployments, now: Optional[datetime] = None) -> d
     }
 
 async def get_deployment_stats(prisma: Prisma, user_id: str = None):
-    """Calcula métricas clave de desempeño filtradas por usuario."""
+    """Calcula métricas clave de desempeño filtradas por usuario y separadas por tipo."""
     where = {}
     if user_id:
         allowed_ids = await _get_team_user_ids(prisma, user_id)
         if allowed_ids:
             where["requested_by_user_id"] = {"in": allowed_ids}
     all_deps = await prisma.deployment.find_many(where=where)
-    return calculate_deployment_stats(all_deps)
+    
+    compose_deps = [d for d in all_deps if d.is_compose]
+    single_deps = [d for d in all_deps if not d.is_compose]
 
+    return {
+        "overall": calculate_deployment_stats(all_deps),
+        "single_service": calculate_deployment_stats(single_deps),
+        "docker_compose": calculate_deployment_stats(compose_deps)
+    }
 
 async def list_team_services(prisma: Prisma, user_id: str) -> List[str]:
     allowed_ids = await _get_team_user_ids(prisma, user_id)

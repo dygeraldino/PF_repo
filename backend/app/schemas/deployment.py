@@ -14,6 +14,7 @@ class DeploymentBase(BaseModel):
     health_path: Optional[str] = Field(default='/health', description="Path for liveness probe, e.g. / or /health")
     container_port: Optional[int] = Field(default=8000, description="Port the container listens on")
     env_vars: Optional[dict] = None
+    is_compose: Optional[bool] = Field(default=False, description="Whether this is a docker-compose deployment")
 
 class DeploymentCreate(DeploymentBase):
     previous_deployment_id: Optional[str] = Field(
@@ -68,6 +69,7 @@ class DeploymentResponse(BaseModel):
     error_message: Optional[str] = None
     notes: Optional[str] = None
     previous_deployment_id: Optional[str] = None
+    is_compose: bool = False
 
     created_at: datetime
     updated_at: datetime
