@@ -288,13 +288,17 @@ async def process_repo_deployment(
                 except Exception as patch_err:
                     logger.warning(f"Could not patch imagePullPolicy: {patch_err}")
 
+            # Construir flags de conexión para kubectl (evitar usar 127.0.0.1 dentro del contenedor)
+            k8s_server = os.getenv("K8S_SERVER_OVERRIDE", "")
+            kubectl_conn = f"--server={k8s_server} --insecure-skip-tls-verify" if k8s_server else ""
+
             # Asegurar namespace
-            ns_proc = await asyncio.create_subprocess_shell("kubectl create namespace staging-ns", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            ns_proc = await asyncio.create_subprocess_shell(f"kubectl {kubectl_conn} create namespace staging-ns", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await ns_proc.communicate()
             
             # Aplicar en kubernetes directamente
             apply_proc = await asyncio.create_subprocess_shell(
-                "kubectl apply -f k8s-manifests.yaml -n staging-ns --validate=false",
+                f"kubectl {kubectl_conn} apply -f k8s-manifests.yaml -n staging-ns --validate=false",
                 cwd=build_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
@@ -348,7 +352,7 @@ spec:
                         _f.write(ingress_manifest)
 
                     ingress_proc = await asyncio.create_subprocess_shell(
-                        f"kubectl apply -f k8s-ingress.yaml -n staging-ns",
+                        f"kubectl {kubectl_conn} apply -f k8s-ingress.yaml -n staging-ns",
                         cwd=build_dir,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE
